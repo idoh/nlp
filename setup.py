@@ -67,6 +67,8 @@ REQUIRED_PKGS = [
     "dataclasses;python_version<'3.7'",
     # filesystem locks e.g. to prevent parallel downloads
     "filelock",
+    # for fast hashing
+    "xxhash"
 ]
 
 TESTS_REQUIRE = [
@@ -108,7 +110,7 @@ EXTRAS_REQUIRE = {
 
 setup(
     name='nlp',
-    version="0.3.0",
+    version="0.4.0",
     description=DOCLINES[0],
     long_description='\n'.join(DOCLINES[2:]),
     author='HuggingFace Inc.',

@@ -15,7 +15,7 @@
 
 # Lint as: python3
 """Access datasets."""
-
+import filecmp
 import importlib
 import inspect
 import itertools
@@ -34,6 +34,8 @@ from filelock import FileLock
 
 from .arrow_dataset import Dataset
 from .builder import DatasetBuilder
+from .dataset_dict import DatasetDict
+from .features import Features
 from .info import DATASET_INFOS_DICT_FILE_NAME, DatasetInfo
 from .metric import Metric
 from .splits import Split
@@ -181,7 +183,12 @@ def get_imports(file_path: str):
                 # The import should be at the same place as the file
                 imports.append(("internal", match.group(2), match.group(2), None))
         else:
-            imports.append(("library", match.group(2), match.group(2), None))
+            if match.group(3):
+                # The import has a comment with `From: git+https:...`, asks user to pip install from git.
+                url_path = match.group(3)
+                imports.append(("library", match.group(2), url_path, None))
+            else:
+                imports.append(("library", match.group(2), match.group(2), None))
 
     return imports
 
@@ -262,7 +269,7 @@ def prepare_module(
     library_imports = []
     for import_type, import_name, import_path, sub_directory in imports:
         if import_type == "library":
-            library_imports.append(import_name)  # Import from a library
+            library_imports.append((import_name, import_path))  # Import from a library
             continue
 
         if import_name == short_name:
@@ -286,15 +293,16 @@ def prepare_module(
 
     # Check library imports
     needs_to_be_installed = []
-    for library_import in library_imports:
+    for library_import_name, library_import_path in library_imports:
         try:
-            lib = importlib.import_module(library_import)  # noqa F841
+            lib = importlib.import_module(library_import_name)  # noqa F841
         except ImportError:
-            needs_to_be_installed.append(library_import)
+            needs_to_be_installed.append((library_import_name, library_import_path))
     if needs_to_be_installed:
         raise ImportError(
-            f"To be able to use this {module_type}, you need to install the following dependencies {needs_to_be_installed} "
-            f"using 'pip install {' '.join(needs_to_be_installed)}' for instance'"
+            f"To be able to use this {module_type}, you need to install the following dependencies"
+            f"{[lib_name for lib_name, lib_path in needs_to_be_installed]} using 'pip install "
+            f"{' '.join([lib_path for lib_name, lib_path in needs_to_be_installed])}' for instance'"
         )
 
     # Define a directory with a unique name in our dataset or metric folder
@@ -356,7 +364,7 @@ def prepare_module(
             else:
                 logger.info("Couldn't find dataset infos file at %s", dataset_infos)
         else:
-            if local_dataset_infos_path is not None:
+            if local_dataset_infos_path is not None and not filecmp.cmp(local_dataset_infos_path, dataset_infos_path):
                 logger.info("Updating dataset infos file from %s to %s", dataset_infos, dataset_infos_path)
                 shutil.copyfile(local_dataset_infos_path, dataset_infos_path)
             else:
@@ -443,6 +451,10 @@ def load_metric(
         in_memory=in_memory,
         **metric_init_kwargs,
     )
+
+    # Download and prepare resources for the metric
+    metric.download_and_prepare(download_config=download_config)
+
     return metric
 
 
@@ -454,12 +466,13 @@ def load_dataset(
     data_files: Union[Dict, List] = None,
     split: Optional[Union[str, Split]] = None,
     cache_dir: Optional[str] = None,
+    features: Optional[Features] = None,
     download_config: Optional[DownloadConfig] = None,
     download_mode: Optional[GenerateMode] = None,
     ignore_verifications: bool = False,
     save_infos: bool = False,
     **config_kwargs,
-) -> Union[Dict[Split, Dataset], Dataset]:
+) -> Union[DatasetDict, Dataset]:
     r"""Load a dataset
 
     This method does the following under the hood:
@@ -499,6 +512,7 @@ def load_dataset(
             If given, will return a single Dataset.
             Splits can be combined and specified like in tensorflow-datasets.
         cache_dir (Optional ``str``): directory to read/write data. Defaults to "~/nlp".
+        features (Optional ``nlp.Features``): Set the features type to use for this dataset.
         download_config (Optional ``nlp.DownloadConfig``: specific download configuration parameters.
         download_mode (Optional `nlp.GenerateMode`): select the download/generate mode - Default to REUSE_DATASET_IF_EXISTS
         ignore_verifications (bool): Ignore the verifications of the downloaded/processed dataset information (checksums/size/splits/...)
@@ -506,11 +520,12 @@ def load_dataset(
         **config_kwargs (Optional ``dict``): keyword arguments to be passed to the ``nlp.BuilderConfig`` and used in the ``nlp.DatasetBuilder``.
 
     Returns:
-        ``nlp.Dataset`` or ``Dict[nlp.Split, nlp.Dataset]``
+        ``nlp.Dataset`` or ``nlp.DatasetDict``
             if `split` is not None: the dataset requested,
-            if `split` is None, a `dict<key: nlp.Split, value: nlp.Dataset>` with each split.
+            if `split` is None, a ``nlp.DatasetDict`` with each split.
 
     """
+    ignore_verifications = ignore_verifications or save_infos
     # Download/copy dataset processing script
     module_path, hash = prepare_module(path, download_config=download_config, dataset=True)
 
@@ -518,26 +533,26 @@ def load_dataset(
     builder_cls = import_main_class(module_path, dataset=True)
 
     # Instantiate the dataset builder
-    builder_instance = builder_cls(
+    builder_instance: DatasetBuilder = builder_cls(
         cache_dir=cache_dir,
         name=name,
         version=version,
         data_dir=data_dir,
         data_files=data_files,
         hash=hash,
+        features=features,
         **config_kwargs,
     )
 
     # Download and prepare data
     builder_instance.download_and_prepare(
-        download_config=download_config,
-        download_mode=download_mode,
-        ignore_verifications=ignore_verifications,
-        save_infos=save_infos,
+        download_config=download_config, download_mode=download_mode, ignore_verifications=ignore_verifications,
     )
 
     # Build dataset for splits
-    ds = builder_instance.as_dataset(split=split)
+    ds = builder_instance.as_dataset(split=split, ignore_verifications=ignore_verifications)
+    if save_infos:
+        builder_instance._save_infos()
 
     return ds
 
